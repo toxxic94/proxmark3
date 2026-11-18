@@ -8636,23 +8636,85 @@ static void DesfireDumpStoreKey(desfire_dump_app_t *app, uint8_t keyno, uint8_t 
     memcpy(app->keys.key[keyno], key, desfire_get_key_length(algo));
 }
 
-// pull keyno for `aid` out of a `hf mfdes chk` key file,  NULL when we have none
-static const uint8_t *DesfireDumpFindKey(const desfire_keys_dump_t *keyfile, uint32_t aid, uint8_t algo, uint8_t keyno) {
+// Locate the recovered-key entry for an AID. `hf mfdes chk` indexes key
+// values by algorithm and key number (key versions are not present).
+static const desfire_app_keys_t *DesfireDumpFindAppKeys(const desfire_keys_dump_t *keyfile, uint32_t aid) {
 
-    if (keyfile == NULL || keyno >= DESFIRE_MAX_KEY_COUNT || algo >= DESFIRE_MAX_ALGO_COUNT) {
+    if (keyfile == NULL) {
         return NULL;
     }
 
     for (uint8_t i = 0; i < keyfile->appcount && i < DESFIRE_MAX_APP_COUNT; i++) {
-        if (keyfile->app[i].aid != aid) {
-            continue;
+        if (keyfile->app[i].aid == aid) {
+            return &keyfile->app[i];
         }
-        if (keyfile->app[i].keys[algo][keyno][0] == 0) {
-            return NULL;
-        }
-        return &keyfile->app[i].keys[algo][keyno][1];
     }
     return NULL;
+}
+
+// Authenticate with recovered keys for this AID, not the key last used at the
+// PICC level. Try the preferred algorithm/key number first, then the other
+// recovered keys. A specified -n restricts the search to that key number.
+// Re-select for each attempt: a failed authentication may invalidate the session.
+// The CLI key remains a fallback ONLY when the keyfile has no eligible key.
+static int DesfireDumpAuthenticateApp(DesfireContext_t *dctx, int securechann,
+                                      DesfireISOSelectWay selectway, uint32_t id,
+                                      const desfire_keys_dump_t *keyfile, uint32_t aid,
+                                      bool noauth, bool verbose, bool keyno_fixed,
+                                      DesfireCryptoAlgorithm preferred_algo,
+                                      uint8_t cli_keyno, DesfireCryptoAlgorithm cli_algo,
+                                      const uint8_t *cli_key) {
+
+    const desfire_app_keys_t *keys = noauth ? NULL : DesfireDumpFindAppKeys(keyfile, aid);
+    int last_res = PM3_ESOFT;
+    size_t tried = 0;
+
+    if (keys != NULL) {
+        // Priority: preferred algo + keyno, preferred algo + any keyno,
+        // other algo + preferred keyno, finally any other recovered key.
+        for (int priority = 0; priority < 4; priority++) {
+            for (uint8_t algo = 0; algo < DESFIRE_MAX_ALGO_COUNT; algo++) {
+                if (securechann == DACLRP && algo != T_AES) {
+                    continue;
+                }
+                for (uint8_t keyno = 0; keyno < DESFIRE_MAX_KEY_COUNT; keyno++) {
+                    if (keyno_fixed && keyno != cli_keyno) {
+                        continue;
+                    }
+                    int order = (algo == preferred_algo ? 0 : 2) + (keyno == cli_keyno ? 0 : 1);
+                    if (order != priority || keys->keys[algo][keyno][0] == 0) {
+                        continue;
+                    }
+
+                    tried++;
+                    DesfireSetKeyNoClear(dctx, keyno, algo, (uint8_t *)&keys->keys[algo][keyno][1]);
+                    if (verbose) {
+                        PrintAndLogEx(INFO, "AID %06X: trying key %u (%s) from keyfile",
+                                      aid, keyno, CLIGetOptionListStr(DesfireAlgoOpts, algo));
+                    }
+                    last_res = DesfireSelectAndAuthenticateAppW(dctx, securechann, selectway, id, false, verbose);
+                    if (last_res == PM3_SUCCESS) {
+                        PrintAndLogEx(INFO, "AID %06X: authenticated with key %u (%s) from keyfile",
+                                      aid, keyno, CLIGetOptionListStr(DesfireAlgoOpts, algo));
+                        return PM3_SUCCESS;
+                    }
+                }
+            }
+        }
+
+        if (tried > 0) {
+            PrintAndLogEx(WARNING, "AID %06X: authentication failed with all %zu eligible recovered key(s); "
+                          "not silently falling back to the CLI/PICC key", aid, tried);
+            return last_res;
+        }
+        PrintAndLogEx(WARNING, "AID %06X: keyfile has no eligible key%s; trying CLI key",
+                      aid, keyno_fixed ? " for the requested -n" : " for the selected secure channel");
+    } else if (keyfile != NULL && verbose && !noauth) {
+        PrintAndLogEx(INFO, "AID %06X: no recovered keys in keyfile; trying CLI key", aid);
+    }
+
+    DesfireSetKeyNoClear(dctx, cli_keyno, cli_algo, (uint8_t *)cli_key);
+    return DesfireSelectAndAuthenticateAppW(dctx, securechann, selectway, id, noauth, verbose);
 }
 
 static void DesfireDumpFillAppMeta(desfire_dump_app_t *app, const AppListElm_t *src) {
@@ -8911,6 +8973,11 @@ static int DesfireDumpCollectApp(DesfireContext_t *dctx, desfire_dump_app_t *app
     size_t filescount = 0;
     bool isopresent = false;
 
+    // The previous application may leave the shared context in Full/encrypted
+    // file-data mode. File enumeration and settings require MACed mode when
+    // authenticated, or Plain when running with --no-auth.
+    DesfireSetCommMode(dctx, DesfireIsAuthenticated(dctx) ? DCMMACed : DCMPlain);
+
     int res = DesfireFillFileList(dctx, FileList, &filescount, &isopresent);
     if (res != PM3_SUCCESS) {
         PrintAndLogEx(WARNING, "Can't get file list for application " _YELLOW_("%06X"), app->aid);
@@ -9010,6 +9077,7 @@ static int CmdHF14ADesDump(const char *Cmd) {
     bool APDULogging = arg_get_lit(ctx, 1);
     bool verbose = arg_get_lit(ctx, 2);
     bool noauth = arg_get_lit(ctx, 15);
+    bool keyno_fixed = ((struct arg_int *)argtable[3])->count > 0;
 
     // an application was named on the command line?  then dump only that one
     bool single_app = (arg_get_str(ctx, 11)->count > 0) ||
@@ -9044,6 +9112,13 @@ static int CmdHF14ADesDump(const char *Cmd) {
 
     SetAPDULogging(APDULogging);
     CLIParserFree(ctx);
+
+    // Store the original CLI credentials before switching to PICC/app keys.
+    // Otherwise a preceding application's recovered key leaks into the next.
+    uint8_t cli_key[DESFIRE_MAX_KEY_SIZE] = {0};
+    memcpy(cli_key, dctx.key, sizeof(cli_key));
+    uint8_t cli_keyno = dctx.keyNum;
+    DesfireCryptoAlgorithm cli_algo = dctx.keyType;
 
     desfire_dump_t *dump = calloc(1, sizeof(desfire_dump_t));
     if (dump == NULL) {
@@ -9199,7 +9274,13 @@ static int CmdHF14ADesDump(const char *Cmd) {
             memcpy(app->dfname, dctx.selectedDFName, app->dfnamelen);
         }
 
-        res = DesfireSelectAndAuthenticateAppW(&dctx, securechann, selectway, id, noauth, verbose);
+        // With an ISO selector and unresolved AID, avoid looking up PICC
+        // recovered keys under the placeholder AID 000000.
+        const desfire_keys_dump_t *appkeys = (idx >= 0 || selectway == ISW6bAID) ? keyfile : NULL;
+        res = DesfireDumpAuthenticateApp(&dctx, securechann, selectway, id,
+                                         appkeys, app->aid, noauth, verbose, keyno_fixed,
+                                         app->settings_ok ? app->keytype : cli_algo,
+                                         cli_keyno, cli_algo, cli_key);
         if (res != PM3_SUCCESS) {
             PrintAndLogEx(ERR, "Select/auth of %s " _RED_("failed"), DesfireWayIDStr(selectway, id));
             DropField();
@@ -9225,33 +9306,17 @@ static int CmdHF14ADesDump(const char *Cmd) {
 
         dump->appcount = appcount;
 
-        // the key we authenticated the PICC with is the fallback for every
-        // application, so keep a copy -- picking a key out of the key file for
-        // one application must not carry over into the next
-        uint8_t basekey[DESFIRE_MAX_KEY_SIZE] = {0};
-        memcpy(basekey, dctx.key, sizeof(basekey));
-        DesfireCryptoAlgorithm basealgo = dctx.keyType;
-
         for (uint8_t i = 0; i < appcount; i++) {
 
             desfire_dump_app_t *app = &dump->app[i];
             DesfireDumpFillAppMeta(app, &AppList[i]);
 
-            // a key from the key file beats the one on the command line
-            // DesfireSetKey() would clear the whole context -- command set,
-            // comm mode, KDF and UID all came from the command line and have to
-            // survive, so only the key itself is swapped
-            const uint8_t *appkey = DesfireDumpFindKey(keyfile, app->aid, app->keytype, dctx.keyNum);
-            if (appkey != NULL) {
-                DesfireSetKeyNoClear(&dctx, dctx.keyNum, app->keytype, (uint8_t *)appkey);
-                if (verbose) {
-                    PrintAndLogEx(INFO, "Application " _YELLOW_("%06X") " using key %u from the key file", app->aid, dctx.keyNum);
-                }
-            } else {
-                DesfireSetKeyNoClear(&dctx, dctx.keyNum, basealgo, basekey);
-            }
-
-            res = DesfireSelectAndAuthenticateAppW(&dctx, securechann, ISW6bAID, app->aid, noauth, verbose);
+            // Settings can report the DES/2TDEA family, while `chk` found
+            // an 8-byte DES key. Search actual recovered algorithm/slot entries.
+            res = DesfireDumpAuthenticateApp(&dctx, securechann, ISW6bAID, app->aid,
+                                             keyfile, app->aid, noauth, verbose, keyno_fixed,
+                                             app->settings_ok ? app->keytype : cli_algo,
+                                             cli_keyno, cli_algo, cli_key);
             if (res != PM3_SUCCESS) {
                 PrintAndLogEx(WARNING, "Application " _YELLOW_("%06X") " select/auth " _RED_("failed") ", skipping", app->aid);
                 continue;
