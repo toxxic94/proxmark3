@@ -8717,6 +8717,33 @@ static int DesfireDumpAuthenticateApp(DesfireContext_t *dctx, int securechann,
     return DesfireSelectAndAuthenticateAppW(dctx, securechann, selectway, id, noauth, verbose);
 }
 
+// Import all recovered values for this application, not just the key that was
+// used to authenticate. The chk keyfile has [algorithm][slot][present + key]
+// entries, but no key versions; versions already read from the PICC are kept.
+// Never associate AID 000000 (also used as an unresolved ISO placeholder) with
+// application keys, and do not mix different key algorithms in one dump app.
+static void DesfireDumpImportRecoveredKeys(desfire_dump_app_t *app,
+                                           const desfire_keys_dump_t *keyfile) {
+    if (app->aid == 0 || app->keytype >= DESFIRE_MAX_ALGO_COUNT) {
+        return;
+    }
+
+    const desfire_app_keys_t *keys = DesfireDumpFindAppKeys(keyfile, app->aid);
+    if (keys == NULL) {
+        return;
+    }
+
+    for (uint8_t keyno = 0; keyno < DESFIRE_MAX_KEY_COUNT; keyno++) {
+        if (app->settings_ok && keyno >= app->numkeys) {
+            break;
+        }
+        const uint8_t *entry = keys->keys[app->keytype][keyno];
+        if (entry[0] != 0) {
+            DesfireDumpStoreKey(app, keyno, app->keytype, &entry[1]);
+        }
+    }
+}
+
 static void DesfireDumpFillAppMeta(desfire_dump_app_t *app, const AppListElm_t *src) {
 
     app->aid = src->appNum;
@@ -9357,6 +9384,7 @@ static int CmdHF14ADesDump(const char *Cmd) {
         }
 
         DesfireDumpCollectApp(&dctx, app, maxlength, selectway, id, securechann, noauth, verbose, appkeys);
+        DesfireDumpImportRecoveredKeys(app, appkeys);
 
     } else {
 
@@ -9389,6 +9417,7 @@ static int CmdHF14ADesDump(const char *Cmd) {
             }
 
             DesfireDumpCollectApp(&dctx, app, maxlength, ISW6bAID, app->aid, securechann, noauth, verbose, keyfile);
+            DesfireDumpImportRecoveredKeys(app, keyfile);
         }
     }
 
