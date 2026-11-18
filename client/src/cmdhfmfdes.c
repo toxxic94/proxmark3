@@ -8964,10 +8964,61 @@ static void DesfireDumpPrintFile(const desfire_dump_file_t *f, bool isopresent) 
     print_buffer_with_offset(f->data, f->datalen, 0, true);
 }
 
+// Authenticate with an actual READ or READ/WRITE key for the file.
+// Key 0 may read settings but does not necessarily have file read permission.
+// Selecting the app again resets the secure-messaging state cleanly.
+static int DesfireDumpEnsureReadKey(DesfireContext_t *dctx, const FileSettings_t *fs,
+                                    const desfire_keys_dump_t *keyfile, uint32_t aid,
+                                    DesfireISOSelectWay selectway, uint32_t id,
+                                    int securechann, bool verbose) {
+    uint8_t permitted[] = {fs->rAccess, fs->rwAccess};
+    if (permitted[0] == 0x0e || permitted[1] == 0x0e) {
+        return PM3_SUCCESS; // free read, no authentication required
+    }
+    for (size_t i = 0; i < ARRAYLEN(permitted); ++i) {
+        if (permitted[i] == dctx->keyNum && DesfireIsAuthenticated(dctx)) {
+            return PM3_SUCCESS;
+        }
+    }
+    const desfire_app_keys_t *keys = DesfireDumpFindAppKeys(keyfile, aid);
+    if (keys == NULL) {
+        PrintAndLogEx(WARNING, "AID %06X file read needs key %u or %u; no recovered keys available",
+                      aid, permitted[0], permitted[1]);
+        return PM3_EINVARG;
+    }
+    for (size_t i = 0; i < ARRAYLEN(permitted); ++i) {
+        uint8_t keyno = permitted[i];
+        if (keyno >= DESFIRE_MAX_KEY_COUNT || keyno == 0x0f || keyno == 0x0e) {
+            continue;
+        }
+        for (uint8_t algo = 0; algo < DESFIRE_MAX_ALGO_COUNT; ++algo) {
+            if (securechann == DACLRP && algo != T_AES) {
+                continue;
+            }
+            if (keys->keys[algo][keyno][0] == 0) {
+                continue;
+            }
+            DesfireSetKeyNoClear(dctx, keyno, algo, (uint8_t *)&keys->keys[algo][keyno][1]);
+            DesfireSetCommMode(dctx, DCMPlain);
+            int res = DesfireSelectAndAuthenticateAppW(dctx, securechann, selectway, id, false, verbose);
+            if (res == PM3_SUCCESS) {
+                if (verbose) {
+                    PrintAndLogEx(INFO, "AID %06X: authenticated for file read with key %u (%s)",
+                                  aid, keyno, CLIGetOptionListStr(DesfireAlgoOpts, algo));
+                }
+                return PM3_SUCCESS;
+            }
+        }
+    }
+    PrintAndLogEx(WARNING, "AID %06X: no usable read key (read=%u, rw=%u)",
+                  aid, permitted[0], permitted[1]);
+    return PM3_ESOFT;
+}
+
 // collect one application.  The caller has already selected and authenticated
 static int DesfireDumpCollectApp(DesfireContext_t *dctx, desfire_dump_app_t *app, uint32_t maxlength,
                                  DesfireISOSelectWay selectway, uint32_t id, int securechann,
-                                 bool noauth, bool verbose) {
+                                 bool noauth, bool verbose, const desfire_keys_dump_t *keyfile) {
 
     FileList_t FileList = {{0}};
     size_t filescount = 0;
@@ -9030,7 +9081,17 @@ static int DesfireDumpCollectApp(DesfireContext_t *dctx, desfire_dump_app_t *app
             continue;
         }
 
-        session_lost = (DesfireDumpReadFile(dctx, &FileList[i].fileSettings, f, maxlength, verbose) == PM3_ESOFT);
+        // Key 0 may read settings but cannot necessarily read file contents.
+        // Select an authenticated recovered key allowed by R or RW rights.
+        int authres = noauth ? PM3_SUCCESS :
+                      DesfireDumpEnsureReadKey(dctx, &FileList[i].fileSettings, keyfile,
+                                               app->aid, selectway, id, securechann, verbose);
+        if (authres == PM3_SUCCESS) {
+            session_lost = (DesfireDumpReadFile(dctx, &FileList[i].fileSettings, f, maxlength, verbose) == PM3_ESOFT);
+        } else {
+            // A failed authentication can invalidate the current session.
+            session_lost = (authres == PM3_ESOFT);
+        }
 
         DesfireDumpPrintFile(f, isopresent);
         DesfirePrintFileSettingsExtended(&FileList[i].fileSettings);
@@ -9068,7 +9129,7 @@ static int CmdHF14ADesDump(const char *Cmd) {
         arg_str0("l", "length",   "<hex>", "Maximum length for read data files (3 hex bytes, big endian)"),
         arg_lit0(NULL, "no-auth", "Execute without authentication"),
         arg_str0("f",  "file",    "<fn>", "Save dump to file, if no <fn> UID will be used as filename"),
-        arg_str0(NULL, "keys",    "<fn>", "Load application keys from a `hf mfdes chk` key file"),
+        arg_str0(NULL, "keys",    "<fn>", "Use recovered PICC/application keys for authentication and file reads"),
         arg_lit0(NULL, "ns",      "No save to file"),
         arg_param_end
     };
@@ -9295,7 +9356,7 @@ static int CmdHF14ADesDump(const char *Cmd) {
             DesfireDumpStoreKey(app, dctx.keyNum, dctx.keyType, dctx.key);
         }
 
-        DesfireDumpCollectApp(&dctx, app, maxlength, selectway, id, securechann, noauth, verbose);
+        DesfireDumpCollectApp(&dctx, app, maxlength, selectway, id, securechann, noauth, verbose, appkeys);
 
     } else {
 
@@ -9327,7 +9388,7 @@ static int CmdHF14ADesDump(const char *Cmd) {
                 DesfireDumpStoreKey(app, dctx.keyNum, dctx.keyType, dctx.key);
             }
 
-            DesfireDumpCollectApp(&dctx, app, maxlength, ISW6bAID, app->aid, securechann, noauth, verbose);
+            DesfireDumpCollectApp(&dctx, app, maxlength, ISW6bAID, app->aid, securechann, noauth, verbose, keyfile);
         }
     }
 
