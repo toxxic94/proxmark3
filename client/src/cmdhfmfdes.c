@@ -8779,6 +8779,57 @@ static void DesfireDumpImportRecoveredKeys(desfire_dump_app_t *app,
     }
 }
 
+// GetKeySettings can be restricted even when a recovered application key works.
+// Query only key slots we actually know, after file collection: a rejected
+// GetKeyVersion drops the PICC session, which must not interrupt file reads.
+static void DesfireDumpCollectKnownKeyVersions(DesfireContext_t *dctx, desfire_dump_app_t *app,
+                                               DesfireISOSelectWay selectway, uint32_t id,
+                                               int securechann, bool verbose, uint8_t auth_keyno) {
+    if (app->settings_ok) {
+        return;
+    }
+
+    bool session_ready = false;
+    for (uint8_t keyno = 0; keyno < DESFIRE_MAX_KEY_COUNT; keyno++) {
+        if (app->keys.present[keyno] == 0) {
+            continue;
+        }
+
+        if (session_ready == false) {
+            DesfireSetCommMode(dctx, DCMPlain);
+            if (app->auth_ok) {
+                // Restore a key that authenticated before any file operations;
+                // file reads may have changed the shared context's key number.
+                if (auth_keyno >= DESFIRE_MAX_KEY_COUNT || app->keys.present[auth_keyno] == 0) {
+                    return;
+                }
+                DesfireSetKeyNoClear(dctx, auth_keyno, app->keytype, app->keys.key[auth_keyno]);
+            }
+            if (DesfireSelectAndAuthenticateAppW(dctx, securechann, selectway, id,
+                                                 !app->auth_ok, verbose) != PM3_SUCCESS) {
+                PrintAndLogEx(WARNING, "AID %06X: cannot select/authenticate for key-version queries", app->aid);
+                return;
+            }
+            DesfireSetCommMode(dctx, DesfireIsAuthenticated(dctx) ? DCMMACed : DCMPlain);
+            session_ready = true;
+        }
+
+        uint8_t version[APDU_RES_LEN] = {0};
+        size_t versionlen = 0;
+        int res = DesfireGetKeyVersion(dctx, &keyno, 1, version, &versionlen);
+        if (res == PM3_SUCCESS && versionlen == 1) {
+            app->keys.version[keyno] = version[0];
+            app->keys.versionknown[keyno] = 1;
+        } else {
+            // A command error ends authentication; reselect for the next slot.
+            session_ready = (res == PM3_SUCCESS);
+            if (verbose) {
+                PrintAndLogEx(WARNING, "AID %06X: key %02u version unavailable", app->aid, keyno);
+            }
+        }
+    }
+}
+
 static void DesfireDumpFillAppMeta(desfire_dump_app_t *app, const AppListElm_t *src) {
 
     app->aid = src->appNum;
@@ -9428,8 +9479,10 @@ static int CmdHF14ADesDump(const char *Cmd) {
             DesfireDumpStoreKey(app, dctx.keyNum, dctx.keyType, dctx.key);
         }
 
+        uint8_t auth_keyno = dctx.keyNum;
         DesfireDumpCollectApp(&dctx, app, maxlength, selectway, id, securechann, noauth, verbose, appkeys);
         DesfireDumpImportRecoveredKeys(app, appkeys);
+        DesfireDumpCollectKnownKeyVersions(&dctx, app, selectway, id, securechann, verbose, auth_keyno);
 
     } else {
 
@@ -9461,8 +9514,10 @@ static int CmdHF14ADesDump(const char *Cmd) {
                 DesfireDumpStoreKey(app, dctx.keyNum, dctx.keyType, dctx.key);
             }
 
+            uint8_t auth_keyno = dctx.keyNum;
             DesfireDumpCollectApp(&dctx, app, maxlength, ISW6bAID, app->aid, securechann, noauth, verbose, keyfile);
             DesfireDumpImportRecoveredKeys(app, keyfile);
+            DesfireDumpCollectKnownKeyVersions(&dctx, app, ISW6bAID, app->aid, securechann, verbose, auth_keyno);
         }
     }
 
