@@ -9341,44 +9341,54 @@ static int CmdHF14ADesDump(const char *Cmd) {
     DropField();
 
     res = DesfireSelectAndAuthenticateAppW(&dctx, securechann, ISW6bAID, 0x000000, noauth, verbose);
-    if (res != PM3_SUCCESS) {
-        PrintAndLogEx(ERR, "PICC level select/auth " _RED_("failed"));
+    bool picc_access_ok = (res == PM3_SUCCESS);
+    if (!picc_access_ok) {
+        // A known native AID can be selected without PICC authentication.
+        // Otherwise we still need PICC access to enumerate applications.
+        if (!single_app || selectway != ISW6bAID || id == 0x000000) {
+            PrintAndLogEx(ERR, "PICC level select/auth " _RED_("failed"));
+            DropField();
+            free(keyfile);
+            free(dump);
+            return res;
+        }
+        PrintAndLogEx(WARNING, "PICC level authentication unavailable; continuing with AID " _YELLOW_("%06X"), id);
         DropField();
-        free(keyfile);
-        free(dump);
-        return res;
     }
 
     // the PICC level is application 000000
     dump->picc.aid = 0x000000;
-    dump->picc.auth_ok = (noauth == false);
+    dump->picc.auth_ok = picc_access_ok && !noauth;
     if (dump->picc.auth_ok) {
         DesfireDumpStoreKey(&dump->picc, dctx.keyNum, dctx.keyType, dctx.key);
     }
 
-    // DesfireFillAppList() -> DesfireFillPICCInfo() already asks for free memory,
-    // key settings and key version 0, so don't ask a second time
     PICCInfo_t PICCInfo = {0};
     AppListS AppList = {{0}};
-    DesfireFillAppList(&dctx, &PICCInfo, AppList, false, false, true);
 
-    // DesfireFillPICCInfo() reports a refused GetFreeMem as 0xffffffff
-    dump->freemem_ok = (PICCInfo.freemem != 0xffffffff);
-    if (dump->freemem_ok) {
-        dump->freemem = PICCInfo.freemem;
+    if (picc_access_ok) {
+        // DesfireFillAppList() also queries PICC metadata. When PICC access
+        // fails, do not record unqueried key settings or versions as known.
+        DesfireFillAppList(&dctx, &PICCInfo, AppList, false, false, true);
+
+        // DesfireFillPICCInfo() reports a refused GetFreeMem as 0xffffffff
+        dump->freemem_ok = (PICCInfo.freemem != 0xffffffff);
+        if (dump->freemem_ok) {
+            dump->freemem = PICCInfo.freemem;
+        }
+
+        dump->picc.keysettings = PICCInfo.keySettings;
+        dump->picc.numkeysraw = PICCInfo.numKeysRaw;
+        dump->picc.numkeys = PICCInfo.numberOfKeys;
+        dump->picc.settings_ok = true;
+
+        // the PICC only hands out the version of key 0
+        dump->picc.keys.version[0] = PICCInfo.keyVersion0;
+        dump->picc.keys.versionknown[0] = 1;
+
+        PrintAndLogEx(NORMAL, "");
+        DesfirePrintPICCInfo(&dctx, &PICCInfo);
     }
-
-    dump->picc.keysettings = PICCInfo.keySettings;
-    dump->picc.numkeysraw = PICCInfo.numKeysRaw;
-    dump->picc.numkeys = PICCInfo.numberOfKeys;
-    dump->picc.settings_ok = true;
-
-    // the PICC only hands out the version of key 0
-    dump->picc.keys.version[0] = PICCInfo.keyVersion0;
-    dump->picc.keys.versionknown[0] = 1;
-
-    PrintAndLogEx(NORMAL, "");
-    DesfirePrintPICCInfo(&dctx, &PICCInfo);
 
     if (single_app) {
 
