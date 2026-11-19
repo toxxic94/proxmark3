@@ -762,6 +762,11 @@ static void desfire_json_save_app(json_t *root, char *path, size_t pathlen, cons
         JsonSaveBufAsHexCompact(root, path, (uint8_t *)&app->numkeysraw, 1);
         snprintf(path, pathlen, "%s.NumKeys", apath);
         JsonSaveInt(root, path, app->numkeys);
+    }
+
+    // Successful authentication identifies the key algorithm even if the
+    // application key settings cannot be read. Preserve it for JSON loading.
+    if (app->settings_ok || app->auth_ok) {
         snprintf(path, pathlen, "%s.KeyType", apath);
         JsonSaveStr(root, path, desfire_algo_name(app->keytype));
     }
