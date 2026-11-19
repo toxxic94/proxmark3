@@ -1564,6 +1564,34 @@ static int AuthCheckDesfireKeyType(DesfireContext_t *dctx,
     return PM3_SUCCESS;
 }
 
+// The PICC-level GetKeySettings response does not identify the PMK algorithm.
+// Its upper NumKeys bits must not be used to exclude AES (or other algorithms).
+// Application-level GetKeySettings does advertise the application key type.
+static void DesfireKeyTypeCandidates(uint8_t numkeysraw, bool picc, bool candidates[4]) {
+    if (picc) {
+        candidates[T_DES] = true;
+        candidates[T_3DES] = true;
+        candidates[T_3K3DES] = true;
+        candidates[T_AES] = true;
+        return;
+    }
+
+    switch (numkeysraw >> 6) {
+        case 0:
+            candidates[T_DES] = true;
+            candidates[T_3DES] = true;
+            break;
+        case 1:
+            candidates[T_3K3DES] = true;
+            break;
+        case 2:
+            candidates[T_AES] = true;
+            break;
+        default:
+            break;
+    }
+}
+
 static int AuthCheckDesfire(DesfireContext_t *dctx,
                             DesfireSecureChannel secureChannel,
                             const uint8_t *aid,
@@ -1606,24 +1634,27 @@ static int AuthCheckDesfire(DesfireContext_t *dctx,
     size_t datalen = 0;
 
     res = DesfireGetKeySettings(dctx, data, &datalen);
-    if (res == PM3_SUCCESS && datalen >= 2) {
+    if (curaid == 0x000000) {
+        // PICC-level GetKeySettings does not encode the PMK algorithm.
+        // Only K0 exists here; test every supported algorithm regardless of
+        // the returned type bits or whether GetKeySettings is accessible.
+        bool candidates[4] = {0};
+        DesfireKeyTypeCandidates(0, true, candidates);
+        des = candidates[T_DES];
+        tdes = candidates[T_3DES];
+        k3kdes = candidates[T_3K3DES];
+        aes = candidates[T_AES];
+        numkeys = 1;
+
+    } else if (res == PM3_SUCCESS && datalen >= 2) {
 
         numkeys = data[1] & 0x0F;
-
-        switch (data[1] >> 6) {
-            case 0:
-                des = true;
-                tdes = true;
-                break;
-            case 1:
-                k3kdes = true;
-                break;
-            case 2:
-                aes = true;
-                break;
-            default:
-                break;
-        }
+        bool candidates[4] = {0};
+        DesfireKeyTypeCandidates(data[1], false, candidates);
+        des = candidates[T_DES];
+        tdes = candidates[T_3DES];
+        k3kdes = candidates[T_3K3DES];
+        aes = candidates[T_AES];
 
     } else {
 
@@ -2347,29 +2378,16 @@ static int CmdHF14aDesDetect(const char *Cmd) {
     size_t datalen = 0;
 
     res = DesfireGetKeySettings(&dctx, data, &datalen);
-    if (res == PM3_SUCCESS && datalen >= 2) {
+    if (DesfireMFSelected(selectway, id)) {
+        // PICC K0 algorithm is not conveyed by GetKeySettings.
+        // Try every candidate, even if GetKeySettings fails.
+        DesfireKeyTypeCandidates(0, true, keytypes);
+        numkeys = 1;
 
-        uint8_t num_keys = data[1];
-        numkeys = num_keys & 0x0F;
+    } else if (res == PM3_SUCCESS && datalen >= 2) {
 
-        switch (num_keys >> 6) {
-            case 0: {
-                keytypes[T_DES] = true;
-                keytypes[T_3DES] = true;
-                break;
-            }
-            case 1: {
-                keytypes[T_3K3DES] = true;
-                break;
-            }
-            case 2: {
-                keytypes[T_AES] = true;
-                break;
-            }
-            default: {
-                break;
-            }
-        }
+        numkeys = data[1] & 0x0F;
+        DesfireKeyTypeCandidates(data[1], false, keytypes);
 
     } else {
         // if fail - check auth commands
@@ -5572,7 +5590,24 @@ static int CmdHF14ADesGetKeySettings(const char *Cmd) {
     }
 
     PrintAndLogEx(INFO, "----------------------- " _CYAN_("Key settings") " -----------------------");
-    PrintKeySettings(buf[0], buf[1], (appid != 0x000000), true);
+    if (DesfireMFSelected(selectway, appid)) {
+        // At PICC level the algorithm is not encoded in GetKeySettings.
+        // Print the access bits and key count without claiming DES/2TDEA.
+        uint8_t ks = buf[0];
+        PrintAndLogEx(SUCCESS, "PICC level rights");
+        PrintAndLogEx(SUCCESS, "[%d...] CMK Configuration changeable               : %s", (ks >> 3) & 1,
+                      (ks & 0x08) ? "YES" : "NO");
+        PrintAndLogEx(SUCCESS, "[.%d..] CMK required for create/delete             : %s", (ks >> 2) & 1,
+                      (ks & 0x04) ? "NO" : "YES");
+        PrintAndLogEx(SUCCESS, "[..%d.] CMK required for AID list / GetKeySettings : %s", (ks >> 1) & 1,
+                      (ks & 0x02) ? "NO" : "YES");
+        PrintAndLogEx(SUCCESS, "[...%d] CMK is changeable                          : %s", ks & 1,
+                      (ks & 0x01) ? "YES" : "NO (frozen)");
+        PrintAndLogEx(INFO, "PICC key type... not reported (determine by authentication)");
+        PrintAndLogEx(INFO, "Key cnt.... %d", buf[1] & 0x0F);
+    } else {
+        PrintKeySettings(buf[0], buf[1], true, true);
+    }
     if (buflen > 2)
         PrintAndLogEx(INFO, "ak ver: %d", buf[2]);
     if (buflen > 3)
