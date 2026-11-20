@@ -9182,10 +9182,59 @@ static int DesfireDumpEnsureReadKey(DesfireContext_t *dctx, const FileSettings_t
     return PM3_ESOFT;
 }
 
+// File enumeration may require the Application Master Key, even when another
+// application key authenticated successfully. Only use key slot 0 when its
+// actual value is known; do not guess a default or derive one from another key.
+// Re-select before authenticating because a denied GetFileIDs can end the
+// previous authenticated session on the card.
+static int DesfireDumpAuthenticateFileListMaster(DesfireContext_t *dctx, desfire_dump_app_t *app,
+                                                 const desfire_keys_dump_t *keyfile,
+                                                 DesfireISOSelectWay selectway, uint32_t id,
+                                                 int securechann, bool verbose,
+                                                 uint8_t cli_keyno, DesfireCryptoAlgorithm cli_algo,
+                                                 const uint8_t *cli_key, bool cli_key_provided) {
+    const desfire_app_keys_t *keys = DesfireDumpFindAppKeys(keyfile, app->aid);
+    DesfireCryptoAlgorithm app_algo = dctx->keyType;
+
+    if (keys != NULL && app_algo < DESFIRE_MAX_ALGO_COUNT &&
+            (securechann != DACLRP || app_algo == T_AES) &&
+            keys->keys[app_algo][0][0] != 0) {
+        const uint8_t *key = &keys->keys[app_algo][0][1];
+        DesfireSetKeyNoClear(dctx, 0, app_algo, (uint8_t *)key);
+        DesfireSetCommMode(dctx, DCMPlain);
+        if (verbose) {
+            PrintAndLogEx(INFO, "AID %06X: retrying file enumeration with recovered application master key 00", app->aid);
+        }
+        if (DesfireSelectAndAuthenticateAppW(dctx, securechann, selectway, id, false, verbose) == PM3_SUCCESS) {
+            DesfireDumpStoreKey(app, 0, app_algo, key);
+            return PM3_SUCCESS;
+        }
+    }
+
+    // Also allow an explicitly supplied CLI master key, if there is one.
+    // Never reinterpret a CLI key for slot 1 (or another slot) as slot 0.
+    if (cli_key_provided && cli_keyno == 0 && cli_algo == app_algo &&
+            (securechann != DACLRP || cli_algo == T_AES)) {
+        DesfireSetKeyNoClear(dctx, 0, cli_algo, (uint8_t *)cli_key);
+        DesfireSetCommMode(dctx, DCMPlain);
+        if (verbose) {
+            PrintAndLogEx(INFO, "AID %06X: retrying file enumeration with CLI application master key 00", app->aid);
+        }
+        if (DesfireSelectAndAuthenticateAppW(dctx, securechann, selectway, id, false, verbose) == PM3_SUCCESS) {
+            DesfireDumpStoreKey(app, 0, cli_algo, cli_key);
+            return PM3_SUCCESS;
+        }
+    }
+
+    return PM3_ESOFT;
+}
+
 // collect one application.  The caller has already selected and authenticated
 static int DesfireDumpCollectApp(DesfireContext_t *dctx, desfire_dump_app_t *app, uint32_t maxlength,
                                  DesfireISOSelectWay selectway, uint32_t id, int securechann,
-                                 bool noauth, bool verbose, const desfire_keys_dump_t *keyfile) {
+                                 bool noauth, bool verbose, const desfire_keys_dump_t *keyfile,
+                                 uint8_t cli_keyno, DesfireCryptoAlgorithm cli_algo,
+                                 const uint8_t *cli_key, bool cli_key_provided) {
 
     FileList_t FileList = {{0}};
     size_t filescount = 0;
@@ -9197,8 +9246,18 @@ static int DesfireDumpCollectApp(DesfireContext_t *dctx, desfire_dump_app_t *app
     DesfireSetCommMode(dctx, DesfireIsAuthenticated(dctx) ? DCMMACed : DCMPlain);
 
     int res = DesfireFillFileList(dctx, FileList, &filescount, &isopresent);
+    if (res != PM3_SUCCESS && !noauth) {
+        // The first authenticated key can be sufficient for file reads but not
+        // for listing file IDs. Retry with key 00 only if we actually know it.
+        if (DesfireDumpAuthenticateFileListMaster(dctx, app, keyfile, selectway, id,
+                                                  securechann, verbose, cli_keyno, cli_algo,
+                                                  cli_key, cli_key_provided) == PM3_SUCCESS) {
+            DesfireSetCommMode(dctx, DCMMACed);
+            res = DesfireFillFileList(dctx, FileList, &filescount, &isopresent);
+        }
+    }
     if (res != PM3_SUCCESS) {
-        PrintAndLogEx(WARNING, "Can't get file list for application " _YELLOW_("%06X"), app->aid);
+        PrintAndLogEx(WARNING, "AID %06X: file listing unavailable; file count is UNKNOWN, not zero", app->aid);
         return res;
     }
 
@@ -9306,6 +9365,7 @@ static int CmdHF14ADesDump(const char *Cmd) {
     bool verbose = arg_get_lit(ctx, 2);
     bool noauth = arg_get_lit(ctx, 15);
     bool keyno_fixed = ((struct arg_int *)argtable[3])->count > 0;
+    bool cli_key_provided = arg_get_str(ctx, 5)->count > 0;
 
     // an application was named on the command line?  then dump only that one
     bool single_app = (arg_get_str(ctx, 11)->count > 0) ||
@@ -9593,7 +9653,8 @@ static int CmdHF14ADesDump(const char *Cmd) {
         }
 
         uint8_t auth_keyno = dctx.keyNum;
-        DesfireDumpCollectApp(&dctx, app, maxlength, selectway, id, securechann, noauth, verbose, appkeys);
+        DesfireDumpCollectApp(&dctx, app, maxlength, selectway, id, securechann, noauth, verbose,
+                              appkeys, cli_keyno, cli_algo, cli_key, cli_key_provided);
         DesfireDumpImportRecoveredKeys(app, appkeys);
         DesfireDumpCollectKnownKeyVersions(&dctx, app, selectway, id, securechann, verbose, auth_keyno);
 
@@ -9634,7 +9695,8 @@ static int CmdHF14ADesDump(const char *Cmd) {
             }
 
             uint8_t auth_keyno = dctx.keyNum;
-            DesfireDumpCollectApp(&dctx, app, maxlength, ISW6bAID, app->aid, securechann, noauth, verbose, keyfile);
+            DesfireDumpCollectApp(&dctx, app, maxlength, ISW6bAID, app->aid, securechann, noauth, verbose,
+                                  keyfile, cli_keyno, cli_algo, cli_key, cli_key_provided);
             DesfireDumpImportRecoveredKeys(app, keyfile);
             DesfireDumpCollectKnownKeyVersions(&dctx, app, ISW6bAID, app->aid, securechann, verbose, auth_keyno);
         }
