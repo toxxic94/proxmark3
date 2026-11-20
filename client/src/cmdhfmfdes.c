@@ -1404,6 +1404,62 @@ typedef struct {
     uint32_t skippedaid;    // applications that could not be selected at all
 } desfire_chk_gaps_t;
 
+// Shared application selection / discovery state for commands that operate on
+// one requested AID or enumerate the entire PICC. AID 000000 is never returned
+// by GetApplicationIDs, so include it explicitly when no --aid was supplied.
+// The caller provides authentication; discovery can be retried in that session.
+typedef struct {
+    uint8_t aids[DESFIRE_MAX_APP_COUNT * 3];
+    size_t len;
+    bool targeted;
+    bool enumerated;
+    bool truncated;
+} desfire_app_discovery_t;
+
+static void DesfireAppDiscoveryInit(desfire_app_discovery_t *discovery, const uint8_t *requested_aid) {
+    memset(discovery, 0, sizeof(*discovery));
+    discovery->len = 3;
+    if (requested_aid != NULL) {
+        memcpy(discovery->aids, requested_aid, 3);
+        discovery->targeted = true;
+    }
+}
+
+// Call with the PICC selected, either before authentication or while the
+// authenticated PICC session is still active. An unsuccessful call leaves the
+// state unchanged so a later authenticated attempt can succeed.
+static int DesfireAppDiscoveryEnumerate(DesfireContext_t *dctx, desfire_app_discovery_t *discovery) {
+    if (discovery->targeted || discovery->enumerated) {
+        return PM3_SUCCESS;
+    }
+
+    uint8_t aidbuf[250] = {0};
+    size_t aidbuflen = 0;
+    int res = DesfireGetAIDList(dctx, aidbuf, &aidbuflen);
+    if (res != PM3_SUCCESS) {
+        return res;
+    }
+    if (aidbuflen > sizeof(aidbuf) || aidbuflen % 3 != 0) {
+        return PM3_ESOFT;
+    }
+
+    size_t available = sizeof(discovery->aids) - 3;
+    size_t kept = MIN(aidbuflen, available);
+    if (aidbuflen > available) {
+        discovery->truncated = true;
+        PrintAndLogEx(WARNING, "Card returned " _YELLOW_("%zu") " applications, only checking the first " _YELLOW_("%d"),
+                      aidbuflen / 3, DESFIRE_MAX_APP_COUNT - 1);
+    }
+    memcpy(&discovery->aids[3], aidbuf, kept);
+    discovery->len += kept;
+    discovery->enumerated = true;
+    return PM3_SUCCESS;
+}
+
+static bool DesfireAppDiscoveryIncomplete(const desfire_app_discovery_t *discovery) {
+    return !discovery->targeted && (!discovery->enumerated || discovery->truncated);
+}
+
 // Select `aid`, retrying while the exchange fails on the link.  PM3_EAPDU_FAIL
 // is the PICC itself answering, so that one is final:  the application really
 // isn't there.  Anything else is a lost exchange and worth another try.
@@ -1457,7 +1513,8 @@ static int AuthCheckDesfireKeyType(DesfireContext_t *dctx,
                                    const int *usedkeys,
                                    desfire_app_keys_t *found,
                                    bool *result,
-                                   desfire_chk_gaps_t *gaps) {
+                                   desfire_chk_gaps_t *gaps,
+                                   desfire_app_discovery_t *discovery) {
 
     size_t keylen = desfire_get_key_length(keytype);
 
@@ -1512,6 +1569,12 @@ static int AuthCheckDesfireKeyType(DesfireContext_t *dctx,
                 found->keys[keytype][keyno][0] = 0x01;
                 memcpy(&found->keys[keytype][keyno][1], key, keylen);
                 *result = true;
+
+                // GetApplicationIDs may require the PICC master key. Try it
+                // before the successful authentication session is cleared.
+                if (discovery && !discovery->enumerated) {
+                    DesfireAppDiscoveryEnumerate(dctx, discovery);
+                }
 
                 // EV2 and LRP turn an authenticated context into a "non first"
                 // auth for the next key number.  Start each one clean instead.
@@ -1602,6 +1665,7 @@ static int AuthCheckDesfire(DesfireContext_t *dctx,
                             desfire_app_keys_t *found,
                             bool *result,
                             desfire_chk_gaps_t *gaps,
+                            desfire_app_discovery_t *discovery,
                             bool verbose) {
 
     uint32_t curaid = (aid[0] & 0xFF) + ((aid[1] & 0xFF) << 8) + ((aid[2] & 0xFF) << 16);
@@ -1803,7 +1867,7 @@ static int AuthCheckDesfire(DesfireContext_t *dctx,
 
         res = AuthCheckDesfireKeyType(dctx, secureChannel, curaid, checks[i].keytype, checks[i].name,
                                       checks[i].list, checks[i].stride, checks[i].len,
-                                      usedkeys, found, result, gaps);
+                                      usedkeys, found, result, gaps, discovery);
         if (res != PM3_SUCCESS) {
             DropField();
             return res;
@@ -1981,8 +2045,8 @@ static int CmdHF14aDesChk(const char *Cmd) {
 
     bool result = false;
     desfire_chk_gaps_t gaps = {0};
-    uint8_t app_ids[DESFIRE_MAX_APP_COUNT * 3] = {0};
-    size_t app_ids_len = 0;
+    desfire_app_discovery_t discovery;
+    DesfireAppDiscoveryInit(&discovery, aidlength ? aid : NULL);
 
     clearCommandBuffer();
 
@@ -2001,34 +2065,11 @@ static int CmdHF14aDesChk(const char *Cmd) {
         return PM3_ESOFT;
     }
 
-
-    // AID 000000 is the PICC level.
-    // GetApplicationIDs never lists it, so it has to be seeded manually
-    memset(app_ids, 0x00, 3);
-    app_ids_len = 3;
-
-    uint8_t aidbuf[250] = {0};
-    size_t aidbuflen = 0;
-    res = DesfireGetAIDList(&dctx, aidbuf, &aidbuflen);
-    if (res == PM3_SUCCESS) {
-
-        if (aidbuflen > sizeof(app_ids) - 3) {
-            PrintAndLogEx(WARNING, "Card returned " _YELLOW_("%zu") " applications, only checking the first " _YELLOW_("%d"), aidbuflen / 3, DESFIRE_MAX_APP_COUNT - 1);
-            aidbuflen = sizeof(app_ids) - 3;
-        }
-
-        memcpy(&app_ids[3], aidbuf, aidbuflen);
-        app_ids_len += aidbuflen;
-
-    } else {
-        // the application list is gated by PICC key settings bit 1, so a locked
-        // card refuses it without auth. That is no reason to give up on the PICC master key
-        PrintAndLogEx(WARNING, "Can't get list of applications on tag, checking PICC level only");
-    }
-
-    if (aidlength != 0) {
-        memcpy(&app_ids[0], aid, 3);
-        app_ids_len = 3;
+    // With an explicit --aid, even 000000, do not discover unrelated AIDs.
+    // Otherwise try unauthenticated enumeration, retrying with a recovered
+    // PICC key later if access is restricted.
+    if (!discovery.targeted && DesfireAppDiscoveryEnumerate(&dctx, &discovery) != PM3_SUCCESS) {
+        PrintAndLogEx(WARNING, "Can't list applications without PICC authentication; will retry after recovering a PICC key");
     }
 
     {
@@ -2093,11 +2134,9 @@ static int CmdHF14aDesChk(const char *Cmd) {
         DropField();
         return PM3_EMALLOC;
     }
-    dump->appcount = app_ids_len / 3;
+    for (uint32_t x = 0; x < discovery.len / 3; x++) {
 
-    for (uint32_t x = 0; x < app_ids_len / 3; x++) {
-
-        uint32_t curaid = (app_ids[x * 3] & 0xFF) + ((app_ids[(x * 3) + 1] & 0xFF) << 8) + ((app_ids[(x * 3) + 2] & 0xFF) << 16);
+        uint32_t curaid = (discovery.aids[x * 3] & 0xFF) + ((discovery.aids[(x * 3) + 1] & 0xFF) << 8) + ((discovery.aids[(x * 3) + 2] & 0xFF) << 16);
         PrintAndLogEx(INFO, "Checking aid " _YELLOW_("%06X"), curaid);
 
         // found keys are tracked per application.  A key number recovered on one
@@ -2183,7 +2222,7 @@ static int CmdHF14aDesChk(const char *Cmd) {
 
                 res = AuthCheckDesfire(&dctx,
                                        secureChannel,
-                                       &app_ids[x * 3],
+                                       &discovery.aids[x * 3],
                                        deskeyList, deskeyListLen,
                                        aeskeyList, aeskeyListLen,
                                        k3kkeyList, k3kkeyListLen,
@@ -2191,6 +2230,7 @@ static int CmdHF14aDesChk(const char *Cmd) {
                                        found,
                                        &foundKeyThisRound,
                                        &gaps,
+                                       (x == 0 && !discovery.targeted) ? &discovery : NULL,
                                        verbose
                                       );
 
@@ -2206,16 +2246,24 @@ static int CmdHF14aDesChk(const char *Cmd) {
             break;
         }
 
+        if (x == 0 && !discovery.targeted && discovery.enumerated) {
+            PrintAndLogEx(SUCCESS, "Application discovery complete: %zu application(s)", (discovery.len / 3) - 1);
+        }
     }
+    dump->appcount = discovery.len / 3;
     if (result == false) {
         PrintAndLogEx(WARNING, "No keys found");
     }
 
     // neither a candidate the PICC never ruled on nor an application that could
     // not be selected is a tested candidate
-    if (gaps.untested || gaps.skippedaid) {
+    if (gaps.untested || gaps.skippedaid || DesfireAppDiscoveryIncomplete(&discovery)) {
 
         PrintAndLogEx(WARNING, "Search was " _YELLOW_("not exhaustive"));
+
+        if (DesfireAppDiscoveryIncomplete(&discovery)) {
+            PrintAndLogEx(WARNING, "    Application enumeration incomplete; some AIDs may not have been checked");
+        }
 
         if (gaps.untested) {
             PrintAndLogEx(WARNING, "    %u candidate%s got no verdict from the card",
@@ -2255,7 +2303,7 @@ static int CmdHF14aDesChk(const char *Cmd) {
     DropField();
 
     // an incomplete search must not look like a completed one to a script
-    return (gaps.untested || gaps.skippedaid) ? PM3_EPARTIAL : PM3_SUCCESS;
+    return (gaps.untested || gaps.skippedaid || DesfireAppDiscoveryIncomplete(&discovery)) ? PM3_EPARTIAL : PM3_SUCCESS;
 }
 
 static int CmdHF14ADesList(const char *Cmd) {
