@@ -9445,19 +9445,65 @@ static int CmdHF14ADesDump(const char *Cmd) {
 
     DropField();
 
-    res = DesfireSelectAndAuthenticateAppW(&dctx, securechann, ISW6bAID, 0x000000, noauth, verbose);
+    // AID 000000 is an explicit PICC-only target, not "all applications".
+    // The same discovery helper used by `chk` distinguishes an omitted AID
+    // from an explicit target. ISO ID and DF name remain single-app selectors.
+    bool picc_only = single_app && selectway == ISW6bAID && id == 0x000000;
+    uint8_t requested_aid[3] = {0};
+    if (single_app && selectway == ISW6bAID) {
+        DesfireAIDUintToByte(id, requested_aid);
+    }
+    desfire_app_discovery_t discovery;
+    DesfireAppDiscoveryInit(&discovery,
+                            (single_app && selectway == ISW6bAID) ? requested_aid : NULL);
+
+    // For a full dump, try directory access without authentication first.
+    // It may be public even when no PICC key is available. A denied request
+    // will be retried after authenticating with the recovered PICC key.
+    if (!single_app) {
+        DesfireSetCommMode(&dctx, DCMPlain);
+        if (DesfireSelectAndAuthenticateAppW(&dctx, securechann, ISW6bAID,
+                                             0x000000, true, verbose) == PM3_SUCCESS) {
+            DesfireAppDiscoveryEnumerate(&dctx, &discovery);
+        }
+        DropField();
+    }
+
+    // Unlike the former CLI-only PICC authentication, this also tries keys
+    // recovered by `chk` under AID 000000. The application-key lookup below
+    // remains separate and never reuses an unrelated PICC key.
+    res = DesfireDumpAuthenticateApp(&dctx, securechann, ISW6bAID, 0x000000,
+                                     keyfile, 0x000000, noauth, verbose, keyno_fixed,
+                                     cli_algo, cli_keyno, cli_algo, cli_key);
     bool picc_access_ok = (res == PM3_SUCCESS);
+
+    if (picc_access_ok && !single_app && !discovery.enumerated) {
+        DesfireAppDiscoveryEnumerate(&dctx, &discovery);
+    }
+
+    if (!single_app && DesfireAppDiscoveryIncomplete(&discovery)) {
+        PrintAndLogEx(ERR, "Cannot completely enumerate applications; refusing to save an incomplete whole-card dump");
+        DropField();
+        free(keyfile);
+        free(dump);
+        return PM3_ESOFT;
+    }
+
     if (!picc_access_ok) {
-        // A known native AID can be selected without PICC authentication.
-        // Otherwise we still need PICC access to enumerate applications.
-        if (!single_app || selectway != ISW6bAID || id == 0x000000) {
+        // Explicit native AID selection, or a successfully enumerated public
+        // directory, can be dumped with the application's own credentials.
+        if (single_app && (selectway != ISW6bAID || picc_only)) {
             PrintAndLogEx(ERR, "PICC level select/auth " _RED_("failed"));
             DropField();
             free(keyfile);
             free(dump);
             return res;
         }
-        PrintAndLogEx(WARNING, "PICC level authentication unavailable; continuing with AID " _YELLOW_("%06X"), id);
+        if (single_app) {
+            PrintAndLogEx(WARNING, "PICC level authentication unavailable; continuing with AID " _YELLOW_("%06X"), id);
+        } else {
+            PrintAndLogEx(WARNING, "PICC level authentication unavailable; continuing without PICC metadata");
+        }
         DropField();
     }
 
@@ -9472,9 +9518,14 @@ static int CmdHF14ADesDump(const char *Cmd) {
     AppListS AppList = {{0}};
 
     if (picc_access_ok) {
-        // DesfireFillAppList() also queries PICC metadata. When PICC access
-        // fails, do not record unqueried key settings or versions as known.
-        DesfireFillAppList(&dctx, &PICCInfo, AppList, false, false, true);
+        // PICC-only requests must not enumerate or inspect any applications.
+        // For other scopes retain the existing metadata/DF-name collection;
+        // it handles GetDFNames outside authenticated sessions for safety.
+        if (picc_only) {
+            DesfireFillPICCInfo(&dctx, &PICCInfo, false);
+        } else {
+            DesfireFillAppList(&dctx, &PICCInfo, AppList, false, false, true);
+        }
 
         // DesfireFillPICCInfo() reports a refused GetFreeMem as 0xffffffff
         dump->freemem_ok = (PICCInfo.freemem != 0xffffffff);
@@ -9492,10 +9543,18 @@ static int CmdHF14ADesDump(const char *Cmd) {
         dump->picc.keys.versionknown[0] = 1;
 
         PrintAndLogEx(NORMAL, "");
-        DesfirePrintPICCInfo(&dctx, &PICCInfo);
+        if (picc_only) {
+            PrintAndLogEx(INFO, "PICC-only dump: application list intentionally not queried");
+        } else {
+            DesfirePrintPICCInfo(&dctx, &PICCInfo);
+        }
     }
 
-    if (single_app) {
+    if (picc_only) {
+        // The PICC is stored in dump->picc, not dump->app[0].
+        dump->appcount = 0;
+
+    } else if (single_app) {
 
         // only the application the user named
         desfire_dump_app_t *app = &dump->app[0];
@@ -9540,17 +9599,23 @@ static int CmdHF14ADesDump(const char *Cmd) {
 
     } else {
 
-        uint8_t appcount = (PICCInfo.appCount > DESFIRE_MAX_APP_COUNT) ? DESFIRE_MAX_APP_COUNT : PICCInfo.appCount;
-        if (PICCInfo.appCount > DESFIRE_MAX_APP_COUNT) {
-            PrintAndLogEx(WARNING, "PICC has %zu applications, dumping the first %d", PICCInfo.appCount, DESFIRE_MAX_APP_COUNT);
-        }
-
+        // Use the verified discovery result to choose what to dump. The
+        // metadata scan is opportunistic and must not silently shrink the
+        // set if a second GetApplicationIDs request fails.
+        size_t appcount = (discovery.len / 3) - 1;
         dump->appcount = appcount;
+        PrintAndLogEx(INFO, "Application discovery complete: %zu application(s)", appcount);
 
-        for (uint8_t i = 0; i < appcount; i++) {
+        for (size_t i = 0; i < appcount; i++) {
 
             desfire_dump_app_t *app = &dump->app[i];
-            DesfireDumpFillAppMeta(app, &AppList[i]);
+            uint32_t aid = DesfireAIDByteToUint(&discovery.aids[(i + 1) * 3]);
+            int idx = DesfireDumpFindApp(AppList, PICCInfo.appCount, &dctx, ISW6bAID, aid);
+            if (idx >= 0) {
+                DesfireDumpFillAppMeta(app, &AppList[idx]);
+            } else {
+                app->aid = aid;
+            }
 
             // Settings can report the DES/2TDEA family, while `chk` found
             // an 8-byte DES key. Search actual recovered algorithm/slot entries.
