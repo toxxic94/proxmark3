@@ -8884,6 +8884,70 @@ static void DesfireDumpCollectKnownKeyVersions(DesfireContext_t *dctx, desfire_d
     }
 }
 
+// The PICC-level application scan may be unable to read GetKeySettings until
+// this application is authenticated. Refresh it after file reads and key-version
+// collection, so an access error cannot interrupt those operations. Prefer a
+// recovered application master key (slot 0), but also try the key which was
+// already proven usable for authentication when the master key is unknown.
+static void DesfireDumpRefreshAppSettings(DesfireContext_t *dctx, desfire_dump_app_t *app,
+                                          DesfireISOSelectWay selectway, uint32_t id,
+                                          int securechann, bool verbose, uint8_t auth_keyno) {
+    if (app->settings_ok) {
+        return;
+    }
+
+    uint8_t keynos[2] = {0, auth_keyno};
+    size_t nkeys = (auth_keyno == 0) ? 1 : 2;
+    if (!app->auth_ok) {
+        // A --no-auth dump must not authenticate with keys merely present in
+        // the image. It may still read publicly accessible settings.
+        nkeys = 1;
+    }
+
+    for (size_t i = 0; i < nkeys; i++) {
+        if (app->auth_ok) {
+            uint8_t keyno = keynos[i];
+            if (keyno >= DESFIRE_MAX_KEY_COUNT || !app->keys.present[keyno]) {
+                continue;
+            }
+            DesfireSetKeyNoClear(dctx, keyno, app->keytype, app->keys.key[keyno]);
+        }
+
+        DesfireSetCommMode(dctx, DCMPlain);
+        if (DesfireSelectAndAuthenticateAppW(dctx, securechann, selectway, id,
+                                             !app->auth_ok, verbose) != PM3_SUCCESS) {
+            continue;
+        }
+        DesfireSetCommMode(dctx, app->auth_ok ? DCMMACed : DCMPlain);
+
+        uint8_t data[APDU_RES_LEN] = {0};
+        size_t datalen = 0;
+        int res = DesfireGetKeySettings(dctx, data, &datalen);
+        if (res == PM3_SUCCESS && datalen >= 2) {
+            // Use both original response bytes. In particular, bit 5 of the
+            // raw key count carries ISO-file-ID information and must survive.
+            app->keysettings = data[0];
+            app->numkeysraw = data[1];
+            app->numkeys = data[1] & 0x1F;
+            app->settings_ok = true;
+            // Authentication already established the actual DES vs 2TDEA
+            // algorithm, which the raw settings bits cannot distinguish.
+            if (!app->auth_ok) {
+                app->keytype = DesfireKeyTypeToAlgo(data[1] >> 6);
+            }
+            if (verbose) {
+                PrintAndLogEx(INFO, "AID %06X: application key settings recovered: %02X %02X",
+                              app->aid, data[0], data[1]);
+            }
+            return;
+        }
+    }
+
+    if (verbose) {
+        PrintAndLogEx(WARNING, "AID %06X: application key settings unavailable; leaving metadata unknown", app->aid);
+    }
+}
+
 static void DesfireDumpFillAppMeta(desfire_dump_app_t *app, const AppListElm_t *src) {
 
     app->aid = src->appNum;
@@ -9657,6 +9721,7 @@ static int CmdHF14ADesDump(const char *Cmd) {
                               appkeys, cli_keyno, cli_algo, cli_key, cli_key_provided);
         DesfireDumpImportRecoveredKeys(app, appkeys);
         DesfireDumpCollectKnownKeyVersions(&dctx, app, selectway, id, securechann, verbose, auth_keyno);
+        DesfireDumpRefreshAppSettings(&dctx, app, selectway, id, securechann, verbose, auth_keyno);
 
     } else {
 
@@ -9699,6 +9764,7 @@ static int CmdHF14ADesDump(const char *Cmd) {
                                   keyfile, cli_keyno, cli_algo, cli_key, cli_key_provided);
             DesfireDumpImportRecoveredKeys(app, keyfile);
             DesfireDumpCollectKnownKeyVersions(&dctx, app, ISW6bAID, app->aid, securechann, verbose, auth_keyno);
+            DesfireDumpRefreshAppSettings(&dctx, app, ISW6bAID, app->aid, securechann, verbose, auth_keyno);
         }
     }
 
